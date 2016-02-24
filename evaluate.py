@@ -3,6 +3,7 @@
 import sys
 import os
 import glob
+from functools import partial
 from tempfile import NamedTemporaryFile
 import numpy as np
 from crow import run_feature_processing_pipeline, apply_crow_aggregation, apply_ucrow_aggregation, normalize
@@ -32,6 +33,28 @@ def get_nn(x, data, k=None):
     dists = dists[idx]
 
     return idx[:k], dists[:k]
+
+
+def simple_query_expansion(Q, data, inds, top_k=10):
+    """
+    Get the top-k closest vectors, average and re-query
+
+    :param ndarray Q:
+        query vector
+    :param ndarray data:
+        index data vectors
+    :param ndarray inds:
+        the indices of index vectors in ascending order of distance
+    :param int top_k:
+        the number of closest vectors to consider
+
+    :returns ndarray idx:
+        the indices of index vectors in ascending order of distance
+    :returns ndarray dists:
+        the squared distances
+    """
+    Q += data[inds[:top_k],:].sum(axis=0)
+    return normalize(Q)
 
 
 def load_features(feature_dir, verbose=True):
@@ -96,16 +119,16 @@ def load_and_aggregate_features(feature_dir, agg_fn):
     return features, names
 
 
-def get_ap(Q, data, query_name, index_names, groundtruth_dir, ranked_dir=None):
+def get_ap(inds, dists, query_name, index_names, groundtruth_dir, ranked_dir=None):
     """
     Given a query, index data, and path to groundtruth data, perform the query,
     and evaluate average precision for the results by calling to the compute_ap
     script. Optionally save ranked results in a file.
 
-    :param ndarray Q:
-        query vector
-    :param ndarray data:
-        index data vectors
+    :param ndarray inds:
+        the indices of index vectors in ascending order of distance
+    :param ndarray dists:
+        the squared distances
     :param str query_name:
         the name of the query
     :param list index_names:
@@ -118,7 +141,6 @@ def get_ap(Q, data, query_name, index_names, groundtruth_dir, ranked_dir=None):
     :returns float:
         the average precision for this query
     """
-    inds, dists = get_nn(Q, data)
 
     if ranked_dir is not None:
         # Create dir for ranked results if needed
@@ -144,7 +166,20 @@ def get_ap(Q, data, query_name, index_names, groundtruth_dir, ranked_dir=None):
     return float(ap.strip())
 
 
-def run_eval(queries_dir, groundtruth_dir, index_features, whiten_features, out_dir, agg_fn, d):
+def fit_whitening(whiten_features, agg_fn, d):
+
+    # Load features for fitting whitening
+    data, _ = load_and_aggregate_features(whiten_features, agg_fn)
+
+    # Whiten, and reduce dim of features
+    # Whitening is trained on the same images that we query against here for expediency
+    print 'Fitting PCA/whitening wth d=%d on %s ...' % (d, whiten_features)
+    _, whiten_params = run_feature_processing_pipeline(data, d=d)
+
+    return whiten_params
+
+
+def run_eval(queries_dir, groundtruth_dir, index_features, whiten_params, out_dir, agg_fn, qe_fn=None):
     """
     Run full evaluation pipeline on specified data.
 
@@ -158,27 +193,8 @@ def run_eval(queries_dir, groundtruth_dir, index_features, whiten_features, out_
     :param int d: final feature dimension
     """
 
-    # Load features for fitting whitening
-    data, image_names = load_and_aggregate_features(whiten_features, agg_fn)
-
-    # Whiten, and reduce dim of features
-    # Whitening is trained on the same images that we query against here for expediency
-    print 'Fitting PCA/whitening wth d=%d on %s ...' % (d, whiten_features)
-    data, params = run_feature_processing_pipeline(data, d=d)
-
-    # Load index features if they are different
-    if whiten_features != index_features:
-
-        # Clear memory
-        del data
-        del image_names
-
-        data, image_names = load_and_aggregate_features(index_features, agg_fn)
-        transformed_data = []
-        for X in data:
-            X, _ = run_feature_processing_pipeline(X, params=params)
-            transformed_data.append(X)
-        data = np.vstack(transformed_data)
+    data, image_names = load_and_aggregate_features(index_features, agg_fn)
+    data, _ = run_feature_processing_pipeline(np.vstack(data), params=whiten_params)
 
     # Iterate queries, process them, rank results, and evaluate mAP
     aps = []
@@ -186,9 +202,16 @@ def run_eval(queries_dir, groundtruth_dir, index_features, whiten_features, out_
         Q = agg_fn(Q)
 
         # Normalize and PCA to final feature
-        Q, _ = run_feature_processing_pipeline(Q, params=params)
+        Q, _ = run_feature_processing_pipeline(Q, params=whiten_params)
 
-        ap = get_ap(Q, data, query_name, image_names, groundtruth_dir, out_dir)
+        inds, dists = get_nn(Q, data)
+
+        # perform query_expansion
+        if qe_fn is not None:
+            Q = qe_fn(Q, data, inds)
+            inds, dists = get_nn(Q, data)
+
+        ap = get_ap(inds, dists, query_name, image_names, groundtruth_dir, out_dir)
         aps.append(ap)
 
     return np.array(aps).mean()
@@ -207,6 +230,7 @@ if __name__ == '__main__':
     parser.add_argument('--groundtruth', dest='groundtruth', type=str, default='oxford/groundtruth/', help='directory containing groundtruth files')
     parser.add_argument('--d', dest='d', type=int, default=128, help='dimension of final feature')
     parser.add_argument('--out', dest='out', type=str, default=None, help='optional path to save ranked output')
+    parser.add_argument('--qe', dest='qe', type=int, default=0, help='perform query expansion with this many top results')
     args = parser.parse_args()
 
     # Select which aggregation function to apply
@@ -215,7 +239,17 @@ if __name__ == '__main__':
     else:
         agg_fn = apply_ucrow_aggregation
 
-    mAP = run_eval(args.queries, args.groundtruth, args.index_features, args.whiten_features, args.out, agg_fn, args.d)
+    if args.qe > 0:
+        qe_fn = partial( simple_query_expansion, top_k=args.qe )
+    else:
+        qe_fn = None
+        
+    # compute whitening params
+    whitening_params = fit_whitening(args.whiten_features, agg_fn, args.d)
+
+    # compute aggregated features and run the evaluation
+    mAP = run_eval(args.queries, args.groundtruth, args.index_features, whitening_params, args.out, agg_fn, qe_fn)
     print 'mAP: %f' % mAP
 
     exit(0)
+
