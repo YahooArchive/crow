@@ -167,6 +167,19 @@ def get_ap(inds, dists, query_name, index_names, groundtruth_dir, ranked_dir=Non
 
 
 def fit_whitening(whiten_features, agg_fn, d):
+    """
+    Calculate whitening parameters
+
+    :param str whiten_features: 
+        directory of features to fit whitening
+    :param callable agg_fn: 
+        aggregation function
+    :param int d: 
+        final feature dimension
+
+    :returns dict params:
+        a dict of transformation parameters
+    """
 
     # Load features for fitting whitening
     data, _ = load_and_aggregate_features(whiten_features, agg_fn)
@@ -190,7 +203,7 @@ def run_eval(queries_dir, groundtruth_dir, index_features, whiten_params, out_di
     :param str whiten_features: directory of features to fit whitening
     :param str out_dir: directory to save query results
     :param callable agg_fn: aggregation function
-    :param int d: final feature dimension
+    :param callable qe_fn: query expansion function
     """
 
     data, image_names = load_and_aggregate_features(index_features, agg_fn)
@@ -240,7 +253,7 @@ if __name__ == '__main__':
         agg_fn = apply_ucrow_aggregation
 
     if args.qe > 0:
-        qe_fn = partial( simple_query_expansion, top_k=args.qe )
+        qe_fn = partial(simple_query_expansion, top_k=args.qe)
     else:
         qe_fn = None
         
